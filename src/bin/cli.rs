@@ -3,44 +3,40 @@ use feed::{
     message::{append, Message, Status},
     reader::ReaderOpts,
 };
-use std::{fs::File, io, path::PathBuf};
+use std::io;
 
 fn main() {
     cli()
 }
 
 pub fn cli() {
-    let config_base = std::env::var("XDG_CONFIG_HOME").unwrap_or("~/.config".to_string());
-    let config_path = vec![config_base, env!("CARGO_PKG_NAME").to_string()].join("/");
-    let path = PathBuf::from(config_path);
-    let config_file = match path.is_file() {
-        true => {
-            println!("TRUE");
-            File::open(path)
-        }
-        false => {
-            println!("Creating file at {path:?}");
-            File::create(path)
-        }
-    };
-    println!("{:?}", config_file);
-    // let config = Config::new();
+    // let config_base = std::env::var("XDG_CONFIG_HOME").unwrap_or("/home/jst/.config".to_string());
+    // let config_path = vec![config_base, env!("CARGO_PKG_NAME").to_string()].join("/");
+    // let path = PathBuf::from(config_path);
+    //
+    // let _config_file = match path.is_file() {
+    //     true => File::open(path),
+    //     false => OpenOptions::new()
+    //         .create(true)
+    //         .read(true)
+    //         .write(true)
+    //         .open(path),
+    // };
+
     let args = Arguments::parse();
 
     match args.command {
         Cmd::Write {
             msg,
-            mut status,
+            status,
             error,
             success,
         } => {
-            if error {
-                status = Some(Status::Error)
-            }
-            if success {
-                status = Some(Status::Success)
-            }
-            let status = status.unwrap();
+            let status = match (error, success) {
+                (true, _) => Status::Error,
+                (_, true) => Status::Success,
+                _ => status.unwrap(),
+            };
             let message = match msg {
                 Some(msg) => Message::new(status, &msg),
                 None => {

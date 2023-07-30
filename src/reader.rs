@@ -1,14 +1,16 @@
 use chrono::{DateTime, Utc};
 
 use crate::message::{Log, Message};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::{collections::BinaryHeap, fs, thread, time::Duration};
 
-const REFRESH_RATE: u64 = 100;
+const REFRESH_RATE: u64 = 500;
 const COLOR_PERIOD: usize = 1000 * 60 * 5;
 const BLINK_MILLIS: u64 = 1500;
 const N_LINES: usize = 10;
-pub const PATH: &str = "./feed.log";
+// pub const PATH: &str = "./feed.log";
 
 #[derive(Default)]
 pub struct ReaderOpts {
@@ -67,8 +69,15 @@ impl Reader {
     }
     pub fn listen(&mut self) {
         let mut history: BinaryHeap<Message> = BinaryHeap::new();
+        let path = log_path();
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+
         loop {
-            let s = fs::read_to_string(PATH).unwrap();
+            let s = fs::read_to_string(log_path()).unwrap();
             self.parse(s, &mut history);
             thread::sleep(Duration::from_millis(REFRESH_RATE));
         }
@@ -106,4 +115,11 @@ pub fn clear() {
 pub enum Age {
     Recent,
     Old,
+}
+
+pub fn log_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap()
+        .join(env!("CARGO_PKG_NAME"))
+        .join("log")
 }

@@ -1,4 +1,1 @@
-{"timestamp":"2023-07-24T00:00:40.056355379Z","status":"Error","message":"Hey you"}
-{"timestamp":"2023-07-24T00:02:59.031512204Z","status":"Success","message":"this works"}
-{"timestamp":"2023-07-24T00:03:05.807371355Z","status":"Error","message":"This sucks"}
-{"timestamp":"2023-07-24T00:03:26.846696450Z","status":"Success","message":"Is this any better?"}
+{"timestamp":"2023-07-30T08:03:32.753313798Z","status":"Success","message":"It worked"}

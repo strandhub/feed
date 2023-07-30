@@ -9,14 +9,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::str::FromStr;
 
-use crate::reader::PATH;
+use crate::reader::log_path;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct Message {
-    // #[serde(with = "time::serde::rfc3339")]
     pub timestamp: DateTime<Utc>,
     pub status: Status,
-    // progress: Progress,
     pub message: String,
 }
 
@@ -104,7 +102,7 @@ enum Progress {
 }
 
 pub fn append(message: Message) {
-    let mut file = OpenOptions::new().append(true).open(PATH).unwrap();
+    let mut file = OpenOptions::new().append(true).open(log_path()).unwrap();
     let msg = serde_json::to_string(&message).unwrap();
     writeln!(file, "{}", msg);
 }
