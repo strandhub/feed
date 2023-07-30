@@ -8,7 +8,7 @@ const REFRESH_RATE: u64 = 100;
 const COLOR_PERIOD: usize = 1000 * 60 * 5;
 const BLINK_MILLIS: u64 = 1500;
 const N_LINES: usize = 10;
-const PATH: &str = "./feed.log";
+pub const PATH: &str = "./feed.log";
 
 #[derive(Default)]
 pub struct ReaderOpts {
