@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::message::{Log, Message};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::{collections::BinaryHeap, fs, thread, time::Duration};
@@ -70,6 +70,7 @@ impl Reader {
     pub fn listen(&mut self) {
         let mut history: BinaryHeap<Message> = BinaryHeap::new();
         let path = log_path();
+        construct_path(path.clone());
         OpenOptions::new()
             .create(true)
             .write(true)
@@ -122,4 +123,8 @@ pub fn log_path() -> PathBuf {
         .unwrap()
         .join(env!("CARGO_PKG_NAME"))
         .join("log")
+}
+
+fn construct_path(path: PathBuf) -> Option<()> {
+    fs::create_dir_all(path.parent()?).ok()
 }
