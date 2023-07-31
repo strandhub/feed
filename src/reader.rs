@@ -96,10 +96,7 @@ impl Reader {
 }
 
 fn validate(s: Option<&str>) -> Option<Message> {
-    match s {
-        Some(res) => serde_json::from_str(&res).unwrap(),
-        None => None,
-    }
+    serde_json::from_str(s?).ok()
 }
 
 pub fn age(ts: DateTime<Utc>, tol_millis: u64) -> Age {
