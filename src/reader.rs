@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::message::{Log, Message};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::{collections::BinaryHeap, fs, thread, time::Duration};
