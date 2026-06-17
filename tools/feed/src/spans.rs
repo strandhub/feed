@@ -9,11 +9,11 @@
 //! processes share is the filesystem, so an open span is represented as
 //! **one small file per span** that survives across processes:
 //!
-//! - enter   → [`write`] `spans/<id>.json`
+//! - enter → [`write`] `spans/<id>.json`
 //! - advance → [`write`] again with a bumped `phase`
-//! - exit    → [`remove`] the file (the caller separately appends a
-//!             settled [`crate::Message`] to the event log, so the row
-//!             collapses into the feed below it)
+//! - exit → [`remove`] the file (the caller separately appends a settled
+//!   [`crate::Message`] to the event log, so the row collapses into the
+//!   feed below it)
 //!
 //! A reader lists the directory ([`list_open`]) to get every currently-
 //! open span. This module owns the span data only — the on-disk format
