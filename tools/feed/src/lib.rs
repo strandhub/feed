@@ -71,6 +71,26 @@ impl Message {
             .format("%H:%M:%S")
             .to_string()
     }
+
+    /// True when this event landed within the last `within_ms` of *now* —
+    /// the "live" highlight (rule A): an event arriving while you watch
+    /// glows briefly and self-expires as it ages, driven by the reader's
+    /// tick loop. Uses wall-clock now, so it's inherently time-relative.
+    pub fn is_fresh(&self, within_ms: i64) -> bool {
+        let age = Utc::now().signed_duration_since(self.timestamp);
+        age >= chrono::Duration::zero() && age < chrono::Duration::milliseconds(within_ms)
+    }
+
+    /// True when this event is strictly newer than `watermark` — the
+    /// "unseen" highlight (rule B): everything that arrived after the last
+    /// time the reader was opened. A `None` watermark (never opened
+    /// before) means nothing has been seen yet, so every event counts.
+    pub fn is_after(&self, watermark: Option<DateTime<Utc>>) -> bool {
+        match watermark {
+            Some(w) => self.timestamp > w,
+            None => true,
+        }
+    }
 }
 
 /// Severity of an event, mirroring `tracing::Level`. Outcome is encoded
@@ -254,5 +274,37 @@ mod tests {
         assert_eq!(Level::from_str("warning").unwrap(), Level::Warn);
         assert_eq!(Level::from_str("err").unwrap(), Level::Error);
         assert!(Level::from_str("nope").is_err());
+    }
+
+    #[test]
+    fn is_fresh_only_for_recent_events() {
+        // An event stamped now is fresh; one a minute old is not.
+        let now = Message::new(Level::Info, "t", "now");
+        assert!(now.is_fresh(1500));
+        let old = Message {
+            timestamp: Utc::now() - chrono::Duration::seconds(60),
+            level: Level::Info,
+            target: "t".into(),
+            message: "old".into(),
+        };
+        assert!(!old.is_fresh(1500));
+    }
+
+    #[test]
+    fn is_after_compares_against_watermark() {
+        let base = Utc.timestamp_opt(1_000, 0).unwrap();
+        let m = Message {
+            timestamp: base,
+            level: Level::Info,
+            target: "t".into(),
+            message: "x".into(),
+        };
+        // Newer than an earlier watermark, not newer than a later one.
+        assert!(m.is_after(Some(base - chrono::Duration::seconds(1))));
+        assert!(!m.is_after(Some(base + chrono::Duration::seconds(1))));
+        // Equal to the watermark is NOT after (strictly newer).
+        assert!(!m.is_after(Some(base)));
+        // No watermark → everything counts as unseen.
+        assert!(m.is_after(None));
     }
 }
