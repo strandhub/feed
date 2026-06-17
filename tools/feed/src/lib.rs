@@ -9,14 +9,20 @@
 //! Events are immutable points in time, modelled on a `tracing::Event`:
 //! a [`Level`] (severity), a `target` (which subsystem), and a message.
 //! Outcome is encoded in the level — an error is logged at [`Level::Error`];
-//! anything else is a settled/successful event. *In-progress* state is a
-//! separate concern (a live span, not an event) and is NOT modelled here.
+//! anything else is a settled/successful event.
 //!
-//! This crate owns the event data only: the on-disk format ([`Message`]
-//! as one JSON object per line) and the read/write primitives. It does
-//! NOT own rendering (the consumer styles by [`Level`]) or any polling
-//! loop. The `tracing`-bridge ([`FeedLayer`]) is behind the `tracing`
-//! feature so the core crate and CLI stay dependency-light.
+//! *In-progress* state is a separate, mutable, cross-process concern — a
+//! live [`Span`] with an enter → advance → exit lifecycle, not an
+//! immutable event. It lives in the [`spans`] module: a distinct on-disk
+//! shape (one file per open span) for a distinct lifecycle. The two share
+//! only this crate's cache-dir location policy.
+//!
+//! This crate owns the *data* for both: the on-disk formats ([`Message`]
+//! as one JSON line in the event log; [`Span`] as one JSON file per span)
+//! and their read/write primitives. It does NOT own rendering (the
+//! consumer styles by [`Level`]) or any polling loop. The `tracing`-bridge
+//! ([`FeedLayer`]) is behind the `tracing` feature so the core crate and
+//! CLI stay dependency-light.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -31,6 +37,9 @@ use serde::{Deserialize, Serialize};
 mod layer;
 #[cfg(feature = "tracing")]
 pub use layer::{init, FeedLayer};
+
+pub mod spans;
+pub use spans::Span;
 
 /// One feed event. Serialized as a single JSON line in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
