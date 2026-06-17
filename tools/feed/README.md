@@ -1,53 +1,74 @@
 ## feed
 
-A tiny append-only activity log shared across workspace tools.
+A tiny append-only **event** log shared across workspace tools, built on
+`tracing`.
 
-A *feeder* (a skill, a CLI, a hook) appends a message as a side effect
-of doing something noteworthy. A *reader* tails the log and renders the
-last few messages. Today the only reader is `claude-overview`'s bottom
-feed panel (toggled with `f`).
+A *feeder* appends an event as a side effect of doing something
+noteworthy. A *reader* tails the log and renders the last few events.
+Today the reader is `claude-overview`'s events widget (toggled with `f`).
 
-This crate owns the **data** only — the on-disk format and the
-read/write primitives. It does not own rendering (the reader styles
-messages by status) or any polling loop (the reader drives its own
-redraws). `claude-overview` is a *consumer* of `feed`, not its owner.
+Events are immutable points in time, modelled on a `tracing::Event`: a
+**level** (severity), a **target** (which subsystem), and a message.
+Outcome is encoded in the level — an error is logged at `error`; anything
+else is a settled/successful event. **In-progress** state (a phasal task
+mid-phase, a build streaming layers) is a *different* concern — a live,
+mutable span, not an event — and is deliberately **not** modelled here.
 
-## Write a message
+This crate owns the event **data** only — the on-disk format and the
+read/write primitives. It does not own rendering (the reader styles by
+level) or any polling loop. `claude-overview` is a *consumer*, not the
+owner.
 
-    feed "task-archive: task-xyz" --success
-    feed "deploy to yggdrasil failed" --error
-    feed "syncing knowledge base"          # no flag → pending/informational
+## Two producer paths
 
-Each call appends one JSON line and prints a confirmation:
+**1. `tracing` (native, for Rust producers).** A producer installs the
+bridge once in `main()` and then just uses `tracing`:
 
-    fed [Success] task-archive: task-xyz
+    feed::init();                              // installs the FeedLayer
+    tracing::info!(target: "task", "archived xyz");
+    tracing::error!(target: "deploy", "boom");
+
+Each event becomes a line in the log, with level + target captured
+automatically. `feed::init()` honors a `FEED_LOG` env filter (default
+`info`) and is best-effort — it never panics or disturbs the producer.
+The bridge lives behind the `tracing` feature:
+
+    feed = { path = "../feed", features = ["tracing"] }
+
+`task` is the first adopter — see its `main.rs`.
+
+**2. The `feed` CLI (bypass, for everything else).** A non-Rust caller
+(or a quick manual line) constructs the same on-disk schema by hand:
+
+    feed "created my-task" --target task
+    feed "deploy failed" --error            # sugar for --level error
+    feed "low detail" --level debug --target deploy
+
+Each call appends one line and prints a confirmation:
+
+    fed [info] task: created my-task
 
 ## On disk
 
 JSONL at `~/.cache/claude-status/feed.log` (the same cache dir
 `claude-overview` already reads), one object per line:
 
-    {"timestamp":"2026-06-17T14:34:04Z","status":"success","message":"…"}
+    {"timestamp":"2026-06-17T15:00:02Z","level":"info","target":"task","message":"…"}
 
-`status` is one of `success` / `error` / `pending`. Malformed lines
-(partial writes, hand-edits) are skipped on read rather than aborting it.
+`level` is one of `trace` / `debug` / `info` / `warn` / `error`.
+Malformed lines (partial writes, hand-edits) are skipped on read.
 
 ## Library
 
-    use feed::{append, tail, default_log_path, Message, Status};
+    use feed::{append, tail, default_log_path, Message, Level};
 
-    append(&default_log_path(), &Message::new(Status::Success, "done"))?;
+    append(&default_log_path(), &Message::new(Level::Info, "task", "done"))?;
     let recent = tail(&default_log_path(), 8); // last 8, oldest first
 
 Read/write primitives take an explicit path so they stay testable;
 `default_log_path()` is the one place location policy lives.
 
-## Build
+## Build / test
 
-    cargo install --path .
-
-## Feeders
-
-Feeders are wired in over time across skills and CLIs (e.g. a `task
-archive` shelling out to `feed`). None ship with this crate yet — it's
-the substrate they'll write into.
+    cargo install --path . --features tracing   # CLI + the tracing bridge
+    cargo test --features tracing               # includes FeedLayer tests

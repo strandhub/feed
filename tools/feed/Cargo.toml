@@ -7,6 +7,11 @@ edition = "2021"
 name = "feed"
 path = "src/bin/feed.rs"
 
+[features]
+# `tracing` enables the FeedLayer bridge. Off by default so the core crate
+# and the CLI bypass stay dependency-light for non-Rust producers.
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -14,6 +19,11 @@ chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = "6"
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# Run the FeedLayer tests with: cargo test -p feed --features tracing
+

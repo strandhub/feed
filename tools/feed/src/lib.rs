@@ -1,15 +1,24 @@
-//! `feed` — a tiny append-only activity log shared across workspace tools.
+//! `feed` — a tiny append-only **event** log shared across workspace tools.
 //!
-//! A *feeder* (a skill, a CLI, a hook) appends a [`Message`] to a log file
-//! as a side effect of doing something noteworthy ("task-archive ran on
-//! task-xyz"). A *reader* — currently `claude-overview`'s bottom panel —
-//! tails the log and renders the last N messages.
+//! A *feeder* (a Rust producer via [`FeedLayer`], or the `feed` CLI as a
+//! bypass) appends a [`Message`] to a log file as a side effect of doing
+//! something noteworthy ("archived task-xyz"). A *reader* — currently
+//! `claude-overview`'s events widget — tails the log and renders the last
+//! N messages.
 //!
-//! This crate owns the data only: the on-disk format ([`Message`] as one
-//! JSON object per line) and the read/write primitives. It deliberately
-//! does NOT own rendering (the consumer styles messages by [`Status`]) or
-//! a polling loop (the consumer drives its own redraws).
+//! Events are immutable points in time, modelled on a `tracing::Event`:
+//! a [`Level`] (severity), a `target` (which subsystem), and a message.
+//! Outcome is encoded in the level — an error is logged at [`Level::Error`];
+//! anything else is a settled/successful event. *In-progress* state is a
+//! separate concern (a live span, not an event) and is NOT modelled here.
+//!
+//! This crate owns the event data only: the on-disk format ([`Message`]
+//! as one JSON object per line) and the read/write primitives. It does
+//! NOT own rendering (the consumer styles by [`Level`]) or any polling
+//! loop. The `tracing`-bridge ([`FeedLayer`]) is behind the `tracing`
+//! feature so the core crate and CLI stay dependency-light.
 
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,20 +27,30 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// One feed entry. Serialized as a single JSON line in the log.
+#[cfg(feature = "tracing")]
+mod layer;
+#[cfg(feature = "tracing")]
+pub use layer::{init, FeedLayer};
+
+/// One feed event. Serialized as a single JSON line in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub timestamp: DateTime<Utc>,
-    pub status: Status,
+    pub level: Level,
+    /// Which subsystem emitted this (e.g. `task`, `deploy`). Mirrors a
+    /// `tracing` event's target; the consumer can color and filter on it.
+    #[serde(default)]
+    pub target: String,
     pub message: String,
 }
 
 impl Message {
-    /// Build a message stamped at the current time.
-    pub fn new(status: Status, message: impl Into<String>) -> Self {
+    /// Build an event stamped at the current time.
+    pub fn new(level: Level, target: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             timestamp: Utc::now(),
-            status,
+            level,
+            target: target.into(),
             message: message.into(),
         }
     }
@@ -45,14 +64,47 @@ impl Message {
     }
 }
 
-/// Outcome a feeder is reporting. Drives the consumer's color choice.
+/// Severity of an event, mirroring `tracing::Level`. Outcome is encoded
+/// here: errors are [`Level::Error`]; a settled success is [`Level::Info`].
+///
+/// Defined locally (rather than re-exporting `tracing::Level`) so the
+/// core crate and the `feed` CLI need nothing from `tracing`. Under the
+/// `tracing` feature, `tracing::Level` converts in via `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Status {
-    Success,
+pub enum Level {
+    Trace,
+    Debug,
+    Info,
+    Warn,
     Error,
-    /// In-progress / informational. Neither green nor red.
-    Pending,
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Level::Trace => "trace",
+            Level::Debug => "debug",
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for Level {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "trace" => Ok(Level::Trace),
+            "debug" => Ok(Level::Debug),
+            "info" => Ok(Level::Info),
+            "warn" | "warning" => Ok(Level::Warn),
+            "error" | "err" => Ok(Level::Error),
+            other => Err(format!("unknown level: {other}")),
+        }
+    }
 }
 
 /// The conventional log location: `~/.cache/claude-status/feed.log`.
@@ -109,10 +161,11 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn msg(status: Status, text: &str, secs: i64) -> Message {
+    fn msg(level: Level, text: &str, secs: i64) -> Message {
         Message {
             timestamp: Utc.timestamp_opt(secs, 0).unwrap(),
-            status,
+            level,
+            target: "test".into(),
             message: text.into(),
         }
     }
@@ -121,13 +174,14 @@ mod tests {
     fn append_then_tail_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feed.log");
-        append(&path, &msg(Status::Success, "one", 1)).unwrap();
-        append(&path, &msg(Status::Error, "two", 2)).unwrap();
+        append(&path, &msg(Level::Info, "one", 1)).unwrap();
+        append(&path, &msg(Level::Error, "two", 2)).unwrap();
         let got = tail(&path, 10);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].message, "one");
         assert_eq!(got[1].message, "two");
-        assert_eq!(got[1].status, Status::Error);
+        assert_eq!(got[1].level, Level::Error);
+        assert_eq!(got[1].target, "test");
     }
 
     #[test]
@@ -135,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feed.log");
         for i in 1..=5 {
-            append(&path, &msg(Status::Pending, &format!("m{i}"), i)).unwrap();
+            append(&path, &msg(Level::Info, &format!("m{i}"), i)).unwrap();
         }
         let got = tail(&path, 3);
         let texts: Vec<&str> = got.iter().map(|m| m.message.as_str()).collect();
@@ -153,14 +207,13 @@ mod tests {
     fn tail_skips_malformed_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feed.log");
-        append(&path, &msg(Status::Success, "good", 1)).unwrap();
-        // Simulate a partial write / hand-edit.
+        // Simulate a partial write / hand-edit between two good lines.
         std::fs::write(
             &path,
             format!(
                 "{}\nnot json\n{}\n",
-                serde_json::to_string(&msg(Status::Success, "good", 1)).unwrap(),
-                serde_json::to_string(&msg(Status::Error, "also good", 2)).unwrap(),
+                serde_json::to_string(&msg(Level::Info, "good", 1)).unwrap(),
+                serde_json::to_string(&msg(Level::Error, "also good", 2)).unwrap(),
             ),
         )
         .unwrap();
@@ -174,13 +227,23 @@ mod tests {
     fn append_creates_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/sub/feed.log");
-        append(&path, &msg(Status::Success, "hi", 1)).unwrap();
+        append(&path, &msg(Level::Info, "hi", 1)).unwrap();
         assert!(path.exists());
     }
 
     #[test]
-    fn status_serializes_lowercase() {
-        let line = serde_json::to_string(&msg(Status::Success, "x", 1)).unwrap();
-        assert!(line.contains("\"status\":\"success\""), "got: {line}");
+    fn level_serializes_lowercase_with_target() {
+        let line = serde_json::to_string(&msg(Level::Warn, "x", 1)).unwrap();
+        assert!(line.contains("\"level\":\"warn\""), "got: {line}");
+        assert!(line.contains("\"target\":\"test\""), "got: {line}");
+    }
+
+    #[test]
+    fn level_parses_aliases() {
+        use std::str::FromStr;
+        assert_eq!(Level::from_str("WARN").unwrap(), Level::Warn);
+        assert_eq!(Level::from_str("warning").unwrap(), Level::Warn);
+        assert_eq!(Level::from_str("err").unwrap(), Level::Error);
+        assert!(Level::from_str("nope").is_err());
     }
 }
