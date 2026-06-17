@@ -3,6 +3,10 @@
 A tiny append-only **event** log shared across workspace tools, built on
 `tracing`.
 
+Registered system: `~/.claude/systems/feed/` (scope.md, issues/). File
+substrate-shaped friction there; producer-side editorial choices route
+to the producer.
+
 A *feeder* appends an event as a side effect of doing something
 noteworthy. A *reader* tails the log and renders the last few events.
 Today the reader is `claude-overview`'s events widget (toggled with `f`).
