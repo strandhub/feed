@@ -80,6 +80,10 @@ enum SpanCommand {
         /// Subsystem for the settled event.
         #[arg(long, default_value = "span")]
         target: String,
+        /// Severity for the settled event. Use `error` to mark the run
+        /// as failed; default `info` is a settled success.
+        #[arg(long, default_value = "info")]
+        level: Level,
     },
 }
 
@@ -128,10 +132,10 @@ fn run_span(cmd: SpanCommand) -> Result<()> {
             println!("span advance {}: {}", id, span.label());
             Ok(())
         }
-        SpanCommand::Exit { id, message, target } => {
+        SpanCommand::Exit { id, message, target, level } => {
             spans::remove(&dir, &id)?;
             let text = message.unwrap_or_else(|| format!("{id} done"));
-            append(&default_log_path(), &Message::new(Level::Info, &target, &text))?;
+            append(&default_log_path(), &Message::new(level, &target, &text))?;
             // Names both side effects: the span closed and what settled.
             println!("span exit {id}: {text}");
             Ok(())
