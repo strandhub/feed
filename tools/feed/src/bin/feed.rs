@@ -59,14 +59,19 @@ enum SpanCommand {
         total: Option<u32>,
     },
     /// Advance an open span to a new phase: rewrite the same file with a
-    /// bumped phase, preserving its name/total/start time. Errors if the
-    /// span isn't open (nothing to advance).
+    /// bumped phase, preserving its total/start time. The name is
+    /// preserved unless `--name` is given (useful when each phase is a
+    /// distinct unit — e.g. the issue being triaged).
     Advance {
         /// Identity passed to `enter`.
         id: String,
         /// New phase number.
         #[arg(long)]
         phase: u32,
+        /// Replacement human label for the row. Omit to keep the existing
+        /// name (the phase-bump-only behavior).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Close a span: delete `spans/<id>.json` AND append one settled event
     /// to the feed log, so the in-progress row collapses into a log line.
@@ -123,11 +128,11 @@ fn run_span(cmd: SpanCommand) -> Result<()> {
             println!("span enter {}: {}", id, span.label());
             Ok(())
         }
-        SpanCommand::Advance { id, phase } => {
+        SpanCommand::Advance { id, phase, name } => {
             let Some(mut span) = spans::read(&dir, &id) else {
                 bail!("no open span `{id}` to advance (call `feed span enter` first)");
             };
-            span.phase = phase;
+            span.advance(phase, name);
             spans::write(&dir, &span)?;
             println!("span advance {}: {}", id, span.label());
             Ok(())

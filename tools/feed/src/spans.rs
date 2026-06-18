@@ -62,6 +62,16 @@ impl Span {
         }
     }
 
+    /// Advance to `phase`, optionally rewriting the human label. `None`
+    /// preserves the existing name (a phase-only bump); `Some(new)` swaps
+    /// it (e.g. each issue of a batch triage).
+    pub fn advance(&mut self, phase: u32, name: Option<String>) {
+        self.phase = phase;
+        if let Some(n) = name {
+            self.name = n;
+        }
+    }
+
     /// `name  phase N/M` (or `name  phase N` when the total is unknown) —
     /// the one-line label a reader renders for this row.
     pub fn label(&self) -> String {
@@ -217,6 +227,31 @@ mod tests {
         let open = list_open(dir.path());
         let ids: Vec<&str> = open.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "zebra"]);
+    }
+
+    #[test]
+    fn advance_can_override_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &Span::enter("triage", "batch", 1, Some(9))).unwrap();
+        let mut s = read(dir.path(), "triage").unwrap();
+        s.advance(2, Some("fix bug in foo".to_string()));
+        write(dir.path(), &s).unwrap();
+        let got = read(dir.path(), "triage").unwrap();
+        assert_eq!(got.phase, 2);
+        assert_eq!(got.name, "fix bug in foo");
+        assert_eq!(got.total, Some(9));
+    }
+
+    #[test]
+    fn advance_without_name_preserves_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &Span::enter("triage", "batch", 1, Some(9))).unwrap();
+        let mut s = read(dir.path(), "triage").unwrap();
+        s.advance(2, None);
+        write(dir.path(), &s).unwrap();
+        let got = read(dir.path(), "triage").unwrap();
+        assert_eq!(got.phase, 2);
+        assert_eq!(got.name, "batch");
     }
 
     #[test]
