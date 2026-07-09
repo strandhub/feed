@@ -138,9 +138,8 @@ fn run_span(cmd: SpanCommand) -> Result<()> {
             Ok(())
         }
         SpanCommand::Exit { id, message, target, level } => {
-            spans::remove(&dir, &id)?;
             let text = message.unwrap_or_else(|| format!("{id} done"));
-            append(&default_log_path(), &Message::new(level, &target, &text))?;
+            spans::exit(&dir, &default_log_path(), &id, level, &target, &text)?;
             // Names both side effects: the span closed and what settled.
             println!("span exit {id}: {text}");
             Ok(())

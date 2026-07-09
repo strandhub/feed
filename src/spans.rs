@@ -27,6 +27,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::{append, Level, Message};
+
 /// One open span. Serialized as a single JSON object in `spans/<id>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
@@ -133,6 +135,26 @@ pub fn remove(dir: &Path, id: &str) -> Result<()> {
     }
 }
 
+/// Close a span and append its settled event in one call: [`remove`] the
+/// span file, then [`append`] a [`Message`] whose `span_id` is set to
+/// `id`. Setting `span_id` is the whole reason to prefer this over the
+/// bare `remove` + `append` pair — it lets a reader that already reflects
+/// span state (the in-progress panel in `claude-overview`) dedupe the
+/// settled event out of its log-line panel. See the `span_id` field docs.
+pub fn exit(
+    spans_dir: &Path,
+    log_path: &Path,
+    id: &str,
+    level: Level,
+    target: impl Into<String>,
+    message: impl Into<String>,
+) -> Result<()> {
+    remove(spans_dir, id)?;
+    let mut msg = Message::new(level, target, message);
+    msg.span_id = Some(id.to_string());
+    append(log_path, &msg)
+}
+
 /// Read one span by id, or `None` if it isn't open (or the file is
 /// malformed — a half-written or hand-edited file is treated as absent
 /// rather than aborting).
@@ -208,6 +230,22 @@ mod tests {
         assert!(read(dir.path(), "t1").is_none());
         // Second remove is a no-op, not an error.
         remove(dir.path(), "t1").unwrap();
+    }
+
+    #[test]
+    fn exit_removes_span_and_stamps_settled_event_with_span_id() {
+        use crate::tail;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("feed.log");
+        write(dir.path(), &Span::enter("t1", "task-one", 1, None)).unwrap();
+        exit(dir.path(), &log, "t1", Level::Info, "task", "task-one done").unwrap();
+        // Span file gone; settled event landed with span_id populated.
+        assert!(read(dir.path(), "t1").is_none());
+        let events = tail(&log, usize::MAX);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].span_id.as_deref(), Some("t1"));
+        assert_eq!(events[0].message, "task-one done");
+        assert_eq!(events[0].target, "task");
     }
 
     #[test]

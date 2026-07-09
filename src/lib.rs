@@ -51,6 +51,16 @@ pub struct Message {
     #[serde(default)]
     pub target: String,
     pub message: String,
+    /// Set when this event describes a span state transition — i.e. it was
+    /// emitted alongside a `spans::remove` call and carries the id of the
+    /// span that just closed. Readers that already reflect span state via
+    /// [`spans::list_open`] can dedupe on this: the collapsing in-progress
+    /// row IS the "settled" signal, so surfacing the same fact again in a
+    /// log-line panel is noise. Absent for non-span emits (`serde` skips
+    /// the field entirely, so on-disk lines stay identical to pre-field
+    /// events and old lines round-trip cleanly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
 }
 
 impl Message {
@@ -61,6 +71,7 @@ impl Message {
             level,
             target: target.into(),
             message: message.into(),
+            span_id: None,
         }
     }
 
@@ -196,6 +207,7 @@ mod tests {
             level,
             target: "test".into(),
             message: text.into(),
+            span_id: None,
         }
     }
 
@@ -268,6 +280,33 @@ mod tests {
     }
 
     #[test]
+    fn message_omits_span_id_when_none() {
+        // Non-span emits stay identical on disk to pre-field events: no
+        // `span_id` key at all. Guards against breaking existing feed.log
+        // consumers or bloating every line with `"span_id":null`.
+        let line = serde_json::to_string(&msg(Level::Info, "x", 1)).unwrap();
+        assert!(!line.contains("span_id"), "got: {line}");
+    }
+
+    #[test]
+    fn message_deserializes_pre_span_id_lines() {
+        // A line written before this field existed round-trips as
+        // `span_id: None`.
+        let old = r#"{"timestamp":"2026-07-09T17:50:52.323817583Z","level":"info","target":"audit","message":"audit run cli-verb-error done"}"#;
+        let m: Message = serde_json::from_str(old).unwrap();
+        assert_eq!(m.span_id, None);
+        assert_eq!(m.target, "audit");
+    }
+
+    #[test]
+    fn message_serializes_span_id_when_set() {
+        let mut m = msg(Level::Info, "x", 1);
+        m.span_id = Some("audit-run-sessions".into());
+        let line = serde_json::to_string(&m).unwrap();
+        assert!(line.contains("\"span_id\":\"audit-run-sessions\""), "got: {line}");
+    }
+
+    #[test]
     fn level_parses_aliases() {
         use std::str::FromStr;
         assert_eq!(Level::from_str("WARN").unwrap(), Level::Warn);
@@ -286,6 +325,7 @@ mod tests {
             level: Level::Info,
             target: "t".into(),
             message: "old".into(),
+            span_id: None,
         };
         assert!(!old.is_fresh(1500));
     }
@@ -298,6 +338,7 @@ mod tests {
             level: Level::Info,
             target: "t".into(),
             message: "x".into(),
+            span_id: None,
         };
         // Newer than an earlier watermark, not newer than a later one.
         assert!(m.is_after(Some(base - chrono::Duration::seconds(1))));
