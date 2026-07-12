@@ -1,0 +1,6 @@
+---
+kind: triage
+date: 2026-06-18
+---
+
+triage by issue-maintainer — accept. Friction is real and concrete (4 R3 streaks, 5-12 calls each, integrator-shaped questions covering log path, event shape, span surface). But filer's proposed surface (scope.md absorbs '## Integrators' section) misreads where the gap lives — scope.md already routes integrators to the crate README and SKILL.md, and the host system has ALREADY filed 'the crate's own README is currently stale on the span surface' as a Known structural tension. Re-derivation including span-shape questions is the predicted symptom of that admitted staleness. Duplicating the integrator map into scope.md would violate the false-modularity test against the README that already owns producer wiring + on-disk schema per scope.md's own routing. Fix in place at the canonical home: refresh ~/.dotfiles/tools/feed/README.md to land the integrator map sub-bullets (a)-(d) — log path, JSONL+span schema with example, emit recipe for both producer paths (tracing bridge and feed CLI), and the list of CLIs already emitting — folding in the known-tension span catch-up in the same edit. Keep scope.md routing pointer; the destination, not the route, needs work. solution:feed-readme-integrator-refresh. winning-axis: surface-of-resolution.

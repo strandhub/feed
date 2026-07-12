@@ -1,11 +1,17 @@
-## feed
+# feed
+
+> TL;DR: Tiny append-only event log + span ledger shared across workspace tools.
 
 A tiny append-only **event** log shared across workspace tools, built on
 `tracing`.
 
-Registered system: `~/.claude/systems/feed/` (scope.md, issues/). File
-substrate-shaped friction there; producer-side editorial choices route
-to the producer.
+- **Scope, boundary, inbox routing** → [SCOPE.md](SCOPE.md).
+- **Skill body** (LLM-facing conventions, when-to-fire) → [skill/SKILL.md](skill/SKILL.md).
+- **Error-lookup skill body** → [skill-error-lookup/SKILL.md](skill-error-lookup/SKILL.md).
+- **Issues** — file friction against this system on this repo's GitHub Issues tab. Legacy pre-migration issues archived read-only in [issues/](issues/).
+
+File substrate-shaped friction files against this repo; producer-side
+editorial choices route to the producer.
 
 A *feeder* appends an event as a side effect of doing something
 noteworthy. A *reader* tails the log and renders the last few events.
