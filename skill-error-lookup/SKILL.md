@@ -4,7 +4,7 @@ description: |
   Read-side workflow for the `feed` substrate: when the user wants to
   see today's (or a recent slice of) errors from the activity log and
   drill into the originating Claude thread for the actual failure
-  detail. Two hops: filter `~/.cache/claude-status/feed.log` for
+  detail. Two hops: filter `~/.local/share/claude-status/feed.log` for
   ERROR rows, then locate the corresponding JSONL thread under
   `~/.claude/projects/-/` (or other project dirs) by mtime and read
   the assistant text to see what actually broke.
@@ -35,8 +35,8 @@ Read errors out of the feed log, then drill into the originating
 Claude thread for the actual failure detail. The feed message is
 intentionally terse ("claude exited with exit status: 1"); the real
 error text lives in the JSONL thread that the failed `claude -p`
-call produced. For schema, level vocabulary, and the on-disk path,
-see `~/.dotfiles/tools/feed/README.md` and the [[feed]] skill —
+call produced. For schema, severity vocabulary, and the on-disk path,
+see `~/projects/feed/README.md` and the [[feed]] skill —
 this skill is the read-join workflow, not the data-plane spec.
 
 ## Recipe
@@ -44,14 +44,28 @@ this skill is the read-join workflow, not the data-plane spec.
 **1. Pull today's error rows from feed.log:**
 
 ```sh
-jq -c 'select(.level == "ERROR" or .level == "error")' \
-   ~/.cache/claude-status/feed.log \
+jq -c 'select(.severity_number >= 17)' \
+   ~/.local/share/claude-status/feed.log \
 | jq -r 'select((.timestamp // "") | startswith("'"$(date -u +%Y-%m-%d)"'"))'
 ```
 
 (Swap the `startswith` date for any UTC-day prefix to look at other
-days. The `level` field is `"error"` from the feed CLI but `"ERROR"`
-from the tracing bridge — match both.)
+days. `severity_number >= 17` matches ERROR; use `>= 13` to include
+WARN — the honest signal for producers that recovered but blocked a
+required side-effect. See the [[feed]] skill for the severity
+semantics.)
+
+**1b. Include WARN (recovered-but-blocked) rows too:**
+
+```sh
+jq -c 'select(.severity_number >= 13)' \
+   ~/.local/share/claude-status/feed.log \
+| jq -r 'select((.timestamp // "") | startswith("'"$(date -u +%Y-%m-%d)"'"))'
+```
+
+WARN rows carry `event_name: "*.degraded"` and `attributes.
+degraded_reason` naming what got blocked — often more actionable
+than an ERROR because the producer had context on the failure.
 
 **2. Find candidate JSONL threads by mtime.**
 
