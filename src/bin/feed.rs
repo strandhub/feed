@@ -1,7 +1,10 @@
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use feed::spans::{self, Span};
-use feed::{append, default_log_path, Level, Message};
+use feed::{
+    append, append_usage, default_log_path, default_usage_log_path, Level, Message, Usage,
+    UsageKind,
+};
 
 /// Append an event to the shared activity feed, or manage an in-progress
 /// span.
@@ -39,6 +42,67 @@ enum Command {
     /// settled event into the log so the row collapses into the feed.
     #[command(subcommand)]
     Span(SpanCommand),
+
+    /// Log one tool-invocation event to the usage log.
+    ///
+    /// Skill-mode events (--kind skill) record that the router pulled a
+    /// skill's guidance into context — NOT that the guidance shaped
+    /// what followed. For staleness queries this is fine; for "which
+    /// skills earn their mental cost" it's a directional but noisy
+    /// proxy. See tasks/0153-tooling-usage-metrics for the design
+    /// story.
+    ///
+    /// The bypass path: non-Rust callers (the `PreToolUse` Skill hook,
+    /// a shell wrapper) construct the same on-disk shape a Rust
+    /// producer would emit via `feed::log_cli_invocation()`.
+    Usage {
+        /// Event kind — closed vocabulary; the whole valid set is:
+        #[arg(long, value_enum)]
+        kind: UsageKindArg,
+        /// Binary name (for `--kind cli`) or skill name (for
+        /// `--kind skill`).
+        #[arg(long)]
+        name: String,
+        /// Skill-mode: the raw `args` string from the Skill tool
+        /// payload (whatever the caller typed after the skill name).
+        #[arg(long)]
+        args: Option<String>,
+        /// Skill-mode: the Claude Code session UUID from the hook
+        /// payload — lets a consumer group skill loads by session.
+        #[arg(long)]
+        session: Option<String>,
+        /// CLI-mode: one argv element (excluding argv[0]). Repeat to
+        /// pass multiple: `--argv log --argv -m --argv "hi"`. Each
+        /// element is truncated to 512 bytes so the line stays under
+        /// POSIX PIPE_BUF (4 KiB) for cross-process append atomicity.
+        #[arg(long)]
+        argv: Vec<String>,
+        /// Cwd at invocation time. Defaults to the process cwd when
+        /// omitted; the hook path overrides with the caller's cwd from
+        /// its payload.
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+}
+
+/// CLI-facing enum for `--kind`, kept separate from the library's
+/// `UsageKind` so clap can derive `ValueEnum`. The `possible values`
+/// list rendered in `--help` is the whole valid set — no upstream doc
+/// lookup needed.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum UsageKindArg {
+    Cli,
+    Skill,
+}
+
+impl From<UsageKindArg> for UsageKind {
+    fn from(k: UsageKindArg) -> Self {
+        match k {
+            UsageKindArg::Cli => UsageKind::Cli,
+            UsageKindArg::Skill => UsageKind::Skill,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -102,6 +166,65 @@ fn main() -> Result<()> {
             }
             run_span(span_cmd)
         }
+        Some(Command::Usage {
+            kind,
+            name,
+            args,
+            session,
+            argv,
+            cwd,
+        }) => {
+            if cli.message.is_some() {
+                bail!("provide either an event message or a `usage` subcommand, not both");
+            }
+            let kind: UsageKind = kind.into();
+            // Kind-specific field validation: reject the wrong-shape
+            // fields at parse-time so a hook misconfigured with e.g.
+            // --argv on a skill event bails loudly instead of writing
+            // a garbled row.
+            match kind {
+                UsageKind::Cli => {
+                    if args.is_some() || session.is_some() {
+                        bail!("--args and --session are skill-mode fields; unused with --kind cli");
+                    }
+                }
+                UsageKind::Skill => {
+                    if !argv.is_empty() {
+                        bail!("--argv is a cli-mode field; unused with --kind skill");
+                    }
+                }
+            }
+            let cwd = cwd.or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+            let ev = Usage {
+                ts: chrono::Utc::now(),
+                kind,
+                name: name.clone(),
+                cwd,
+                argv: if matches!(kind, UsageKind::Cli) {
+                    // Truncate here to match the Rust-side Usage::cli
+                    // behavior (cap at 512 bytes/element).
+                    Some(argv.into_iter().map(truncate_argv).collect())
+                } else {
+                    None
+                },
+                args,
+                session,
+            };
+            append_usage(&default_usage_log_path(), &ev)?;
+            // Mutation verb: one explicit success line naming what
+            // landed. The callsite (a hook, a shell wrapper) reads this
+            // to confirm the append happened.
+            let kind_str = match kind {
+                UsageKind::Cli => "cli",
+                UsageKind::Skill => "skill",
+            };
+            println!("logged usage: {kind_str} {name}");
+            Ok(())
+        }
         None => {
             let Some(message) = cli.message else {
                 bail!("a message is required (or use the `span` subcommand)");
@@ -115,6 +238,26 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Cap each `--argv` element at 512 bytes so a single usage line stays
+/// under POSIX PIPE_BUF (4 KiB) — the atomic-append threshold for
+/// concurrent writers. Mirrors `feed::usage::truncate_argv_element`;
+/// duplicated (not re-exported) to keep the library's public surface
+/// small.
+fn truncate_argv(s: String) -> String {
+    const CAP: usize = 512;
+    if s.len() <= CAP {
+        return s;
+    }
+    let mut end = CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 3);
+    out.push_str(&s[..end]);
+    out.push('…');
+    out
 }
 
 fn run_span(cmd: SpanCommand) -> Result<()> {

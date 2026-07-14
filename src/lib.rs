@@ -36,10 +36,15 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "tracing")]
 mod layer;
 #[cfg(feature = "tracing")]
-pub use layer::{init, FeedLayer};
+pub use layer::{init, log_cli_invocation, FeedLayer, UsageLayer};
 
 pub mod spans;
 pub use spans::Span;
+
+pub mod usage;
+pub use usage::{
+    append_usage, default_usage_log_path, read_all_usage, Kind as UsageKind, Usage,
+};
 
 /// One feed event. Serialized as a single JSON line in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
