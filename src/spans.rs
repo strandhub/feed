@@ -12,7 +12,7 @@
 //! - enter → [`write`] `spans/<id>.json`
 //! - advance → [`write`] again with a bumped `phase`
 //! - exit → [`remove`] the file (the caller separately appends a settled
-//!   [`crate::Message`] to the event log, so the row collapses into the
+//!   [`crate::LogRecord`] to the event log, so the row collapses into the
 //!   feed below it)
 //!
 //! A reader lists the directory ([`list_open`]) to get every currently-
@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{append, Level, Message};
+use crate::{append, LogRecord, SeverityNumber};
 
 /// One open span. Serialized as a single JSON object in `spans/<id>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,24 +135,26 @@ pub fn remove(dir: &Path, id: &str) -> Result<()> {
     }
 }
 
-/// Close a span and append its settled event in one call: [`remove`] the
-/// span file, then [`append`] a [`Message`] whose `span_id` is set to
-/// `id`. Setting `span_id` is the whole reason to prefer this over the
-/// bare `remove` + `append` pair — it lets a reader that already reflects
-/// span state (the in-progress panel in `claude-overview`) dedupe the
-/// settled event out of its log-line panel. See the `span_id` field docs.
+/// Close a span and append its settled record in one call: [`remove`]
+/// the span file, then [`append`] a [`LogRecord`] whose `trace_id` and
+/// `span_id` are set to `id`. Setting the correlation ids is the whole
+/// reason to prefer this over the bare `remove` + `append` pair — it
+/// lets a reader that already reflects span state (the in-progress
+/// panel in `claude-overview`) dedupe the settled record out of its
+/// log-line panel.
 pub fn exit(
     spans_dir: &Path,
     log_path: &Path,
     id: &str,
-    level: Level,
-    target: impl Into<String>,
-    message: impl Into<String>,
+    severity: SeverityNumber,
+    source: impl Into<String>,
+    body: impl Into<String>,
 ) -> Result<()> {
     remove(spans_dir, id)?;
-    let mut msg = Message::new(level, target, message);
-    msg.span_id = Some(id.to_string());
-    append(log_path, &msg)
+    let mut record = LogRecord::new(severity, source, body);
+    record.trace_id = Some(id.to_string());
+    record.span_id = Some(id.to_string());
+    append(log_path, &record)
 }
 
 /// Read one span by id, or `None` if it isn't open (or the file is
@@ -233,19 +235,22 @@ mod tests {
     }
 
     #[test]
-    fn exit_removes_span_and_stamps_settled_event_with_span_id() {
+    fn exit_removes_span_and_stamps_settled_record_with_span_and_trace_ids() {
         use crate::tail;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("feed.log");
         write(dir.path(), &Span::enter("t1", "task-one", 1, None)).unwrap();
-        exit(dir.path(), &log, "t1", Level::Info, "task", "task-one done").unwrap();
-        // Span file gone; settled event landed with span_id populated.
+        exit(dir.path(), &log, "t1", SeverityNumber::Info, "task", "task-one done").unwrap();
+        // Span file gone; settled record landed with span_id and
+        // trace_id populated (both = the span id in our single-span
+        // model, per LogRecord docs).
         assert!(read(dir.path(), "t1").is_none());
-        let events = tail(&log, usize::MAX);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].span_id.as_deref(), Some("t1"));
-        assert_eq!(events[0].message, "task-one done");
-        assert_eq!(events[0].target, "task");
+        let records = tail(&log, usize::MAX);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].span_id.as_deref(), Some("t1"));
+        assert_eq!(records[0].trace_id.as_deref(), Some("t1"));
+        assert_eq!(records[0].body, "task-one done");
+        assert_eq!(records[0].source(), "task");
     }
 
     #[test]
