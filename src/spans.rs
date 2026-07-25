@@ -22,12 +22,26 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{append, LogRecord, SeverityNumber};
+
+/// Process-global current span id, set by whoever opens the span and
+/// read by deep-in-the-stack code that wants to narrate progress
+/// without threading the id through every function signature.
+///
+/// Modeled on `tracing::Span::current()`: an outer scope enters a span
+/// and any code invoked within can annotate that span in flight without
+/// knowing its identity. Because our spans live on disk (cross-process),
+/// this is only useful within one process — a child process invoked via
+/// `Command::new` starts with a clean slate and must be told the id
+/// explicitly (e.g. via an env var or CLI flag) if it wants to advance
+/// the same span.
+static CURRENT_SPAN_ID: Mutex<Option<String>> = Mutex::new(None);
 
 /// One open span. Serialized as a single JSON object in `spans/<id>.json`.
 ///
@@ -70,6 +84,38 @@ impl Span {
     pub fn label(&self) -> String {
         self.name.clone()
     }
+}
+
+/// Set the process-global current span id. Called by whoever opens the
+/// outer span; deep-in-the-stack code then calls [`advance_current`]
+/// without needing to know the id. Pair with [`clear_current`] before
+/// the span exits.
+pub fn set_current(id: impl Into<String>) {
+    if let Ok(mut cur) = CURRENT_SPAN_ID.lock() {
+        *cur = Some(id.into());
+    }
+}
+
+/// Clear the process-global current span id. Called by whoever set it,
+/// after the span exits (so a stale id doesn't leak into a later span
+/// opened by the same process).
+pub fn clear_current() {
+    if let Ok(mut cur) = CURRENT_SPAN_ID.lock() {
+        *cur = None;
+    }
+}
+
+/// Advance the process-global current span in flight, if one is set.
+/// A no-op if [`set_current`] was never called (e.g. called from a
+/// test, or outside a runner-managed context) — narration is
+/// best-effort and never blocks the caller.
+pub fn advance_current(name: impl Into<String>) {
+    let Ok(cur) = CURRENT_SPAN_ID.lock() else { return };
+    let Some(id) = cur.as_ref() else { return };
+    let dir = spans_dir();
+    let Some(mut span) = read(&dir, id) else { return };
+    span.advance(name);
+    let _ = write(&dir, &span);
 }
 
 /// The conventional spans directory: `~/.cache/claude-status/spans/`.
@@ -269,6 +315,29 @@ mod tests {
         write(dir.path(), &s).unwrap();
         let got = read(dir.path(), "triage").unwrap();
         assert_eq!(got.name, "fix bug in foo");
+    }
+
+    #[test]
+    fn advance_current_no_op_when_unset() {
+        // Preconditions: no current span set. Should not panic, should
+        // not write anything anywhere. Best-effort narration from a
+        // caller invoked outside a runner-managed context.
+        clear_current();
+        advance_current("orphan narration");
+    }
+
+    #[test]
+    fn set_and_clear_current_are_idempotent() {
+        // Double-set overwrites; double-clear is a no-op. This shape
+        // matches how a nested caller might set-then-clear inside an
+        // outer set-then-clear without corrupting the outer id (well,
+        // it does — the outer would find a cleared slot on its own
+        // clear — which is acceptable for the current single-runner
+        // usage. If nested spans ever land, this would need a stack.)
+        set_current("first");
+        set_current("second");
+        clear_current();
+        clear_current();
     }
 
     #[test]
