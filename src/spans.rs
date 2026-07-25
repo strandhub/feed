@@ -298,20 +298,54 @@ fn is_stale(span: &Span, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// Best-effort liveness probe. On Linux, `/proc/<pid>` presence is
-/// authoritative for "process exists"; on other platforms we can't cheaply
-/// tell, so we conservatively report alive (never reap) to avoid unlinking
-/// a live process's span. PID reuse is a theoretical false-negative
-/// (reaper skips a span whose owner died and its PID was reassigned) —
-/// tolerated because the alternative is unlinking a live span, which is
-/// worse. On non-Linux this whole check is a no-op and stale spans fall
-/// through to the legacy age rule.
+/// Best-effort liveness probe via POSIX `kill(pid, 0)` — the standard
+/// way to ask "does this process exist" on any Unix (Linux, macOS, BSDs).
+/// Sending signal 0 performs the permission check but doesn't deliver a
+/// signal:
+///
+/// - `Ok(())` → process exists and we could have signalled it → alive.
+/// - `Err(EPERM)` → process exists but we lack permission (different
+///   uid / capability set). Still alive — reported as such so we don't
+///   unlink a live process's span.
+/// - `Err(ESRCH)` → no such process → dead → reap.
+///
+/// PID reuse is a theoretical false-negative (reaper skips a span whose
+/// owner died and its PID was reassigned to something else) — tolerated
+/// because the alternative is unlinking a live span, which is strictly
+/// worse. Non-Unix platforms conservatively report alive; stale spans on
+/// those hosts fall through to the legacy age rule.
 fn pid_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        // `pid_t` is `i32` on all Unix targets we run on. A `u32` that
+        // doesn't fit — or that fits but as a non-positive pid_t after
+        // sign reinterpretation — is not a legitimate process id, and
+        // handing it to `kill(2)` invokes the broadcast/process-group
+        // forms (0 = "every process in our pgrp", -1 = "every process
+        // we can signal", other negatives = pgid targets). Any of those
+        // would spuriously return success and hold a ghost span alive.
+        // Reject them up front as dead.
+        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid_t <= 0 {
+            return false;
+        }
+        // SAFETY: `kill(pid, 0)` with signal 0 is defined by POSIX to be
+        // a permission/existence probe with no side effects. No memory
+        // is read or written; the only observable is the return value
+        // and `errno`. `pid_t` is now guaranteed positive.
+        let ret = unsafe { libc::kill(pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        // ESRCH is the only "definitely dead" errno; anything else
+        // (EPERM = alive but not signal-able by us, EINVAL = shouldn't
+        // happen with sig=0) reports alive to stay safe.
+        !matches!(err.raw_os_error(), Some(libc::ESRCH))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let _ = pid;
         true
@@ -319,30 +353,47 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// RAII guard that removes the span file on drop, so an in-process panic
-/// between enter and exit doesn't leak a ghost span. Owns the span id and
-/// the spans dir; drop is best-effort (a failed unlink is silently
-/// swallowed — the reaper on the read side is the backstop).
+/// between enter and exit doesn't leak a ghost span. Owns two resources:
+///
+/// 1. The span file at `spans/<id>.json` — removed on drop.
+/// 2. The process-global [`CURRENT_SPAN_ID`] — set to this guard's id at
+///    enter, cleared on drop. Callers no longer set/clear `CURRENT_SPAN_ID`
+///    manually; the guard owns that pairing so a panic between set and
+///    clear can't leak a stale id into a later span in the same process.
+///
+/// Drop is best-effort (a failed unlink is silently swallowed — the
+/// reaper on the read side is the backstop).
 ///
 /// Callers that want the explicit exit path — [`exit`] appends a settled
-/// [`LogRecord`] alongside removal — must call [`SpanGuard::disarm`]
-/// first so the guard doesn't double-remove after the settled record has
-/// already landed. The `disarm` → `exit` sequence is the happy path; the
-/// guard exists for panics, `?` early returns, and any other unwinding
-/// path that skips the explicit exit.
+/// [`LogRecord`] alongside removal — call [`SpanGuard::disarm`] first so
+/// the guard doesn't double-remove after the settled record has already
+/// landed. `disarm` only suppresses the file removal; the
+/// `CURRENT_SPAN_ID` clear still happens on drop, so the current-id
+/// invariant holds regardless of which exit path the caller took.
 ///
 /// Does NOT help with `SIGKILL` / OOM / host reboot / cross-process spans
 /// — Rust can't run destructors on aborts. That's the reaper's job.
 #[must_use = "SpanGuard removes the span file on drop; hold it for the span's lifetime"]
 pub struct SpanGuard {
     dir: PathBuf,
+    /// `Some` while the guard is armed for file removal. `disarm` takes
+    /// this without also releasing the current-id ownership below.
     id: Option<String>,
+    /// True iff this guard successfully set `CURRENT_SPAN_ID` at enter
+    /// — i.e., is responsible for clearing it on drop. False when the
+    /// mutex was poisoned at enter (rare); drop then leaves the slot
+    /// alone rather than clearing someone else's id.
+    owns_current: bool,
 }
 
 impl SpanGuard {
     /// Enter a span and take a guard that will remove the file on drop.
-    /// Writes the span file eagerly; if the write fails the guard is
-    /// still returned (armed with the id), so a subsequent drop tries a
-    /// best-effort cleanup — no worse than the no-guard status quo.
+    /// Writes the span file eagerly, and sets [`CURRENT_SPAN_ID`] so
+    /// deep-in-the-stack code can call [`advance_current`] without
+    /// threading the id through every function signature. If either
+    /// side-effect fails (write error, mutex poisoning) the guard is
+    /// still returned so drop can attempt best-effort cleanup — no
+    /// worse than the no-guard status quo.
     pub fn enter(dir: impl Into<PathBuf>, id: impl Into<String>, name: impl Into<String>) -> Self {
         Self::enter_owned_by(dir, id, name, std::process::id())
     }
@@ -359,7 +410,13 @@ impl SpanGuard {
         let id = id.into();
         let span = Span::enter_owned_by(id.clone(), name, pid);
         let _ = write(&dir, &span);
-        Self { dir, id: Some(id) }
+        let owns_current = if let Ok(mut cur) = CURRENT_SPAN_ID.lock() {
+            *cur = Some(id.clone());
+            true
+        } else {
+            false
+        };
+        Self { dir, id: Some(id), owns_current }
     }
 
     /// The span id this guard is holding open.
@@ -367,9 +424,11 @@ impl SpanGuard {
         self.id.as_deref().unwrap_or("")
     }
 
-    /// Suppress the drop-time removal — the caller is taking over cleanup
-    /// (typically via [`exit`], which removes the file and appends a
-    /// settled record atomically). Idempotent.
+    /// Suppress the drop-time file removal — the caller is taking over
+    /// that side (typically via [`exit`], which removes the file and
+    /// appends a settled record atomically). Idempotent. Does NOT
+    /// release `CURRENT_SPAN_ID` ownership; the guard still clears it
+    /// on drop so a subsequent span in this process starts clean.
     pub fn disarm(&mut self) {
         self.id = None;
     }
@@ -379,6 +438,11 @@ impl Drop for SpanGuard {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
             let _ = remove(&self.dir, &id);
+        }
+        if self.owns_current {
+            if let Ok(mut cur) = CURRENT_SPAN_ID.lock() {
+                *cur = None;
+            }
         }
     }
 }
@@ -529,32 +593,62 @@ mod tests {
 
     #[test]
     fn list_open_reaps_span_whose_pid_is_dead() {
-        // A span recorded against a PID that (a) is virtually certain not
-        // to exist and (b) is small enough to be a valid pid_t on Linux.
-        // We can't spawn-and-kill a process portably in a unit test — the
-        // fake-pid approach is what the reaper is actually built to catch.
+        // A span recorded against a PID that's virtually certain not to
+        // exist. u32::MAX exceeds every platform's practical pid range,
+        // so `kill(pid, 0)` returns ESRCH on both Linux and macOS.
+        // We can't spawn-and-kill a process portably in a unit test —
+        // the fake-pid approach is what the reaper is actually built to
+        // catch.
         let dir = tempfile::tempdir().unwrap();
         let ghost = Span {
             id: "ghost".to_string(),
             name: "ghost span".to_string(),
             started: Utc::now(),
-            pid: Some(1),  // PID 1 always exists (init); use a fake ghost
+            pid: Some(u32::MAX),
         };
-        // Overwrite the pid to something guaranteed-absent. u32::MAX is a
-        // safe choice: exceeds Linux's default pid_max and every other
-        // platform's practical range.
-        let ghost = Span { pid: Some(u32::MAX), ..ghost };
         write(dir.path(), &ghost).unwrap();
-        // On Linux, list_open reaps and returns empty; the file is gone.
-        // On other platforms pid_alive returns true (conservative) so the
-        // span survives — we only assert the Linux path here since that's
-        // where the reaper does real work.
-        #[cfg(target_os = "linux")]
+        // Unix (Linux, macOS, BSDs): list_open reaps and returns empty;
+        // the file is gone. Non-Unix conservatively reports alive so the
+        // span survives — asserted separately.
+        #[cfg(unix)]
         {
             let open = list_open(dir.path());
             assert!(open.is_empty(), "ghost span should be reaped");
             assert!(read(dir.path(), "ghost").is_none(), "file should be unlinked");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_reports_true_for_own_process() {
+        // Self-liveness is the tightest sanity check for the kill(0)
+        // probe: our own PID must always report alive, on every Unix.
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_reports_false_for_ghost_pid() {
+        // A value comfortably above Linux's default pid_max (4194304)
+        // and macOS's ceiling (99998), but still within pid_t's positive
+        // range. ESRCH → reported dead on both platforms.
+        assert!(!pid_alive(9_999_999));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_rejects_zero_and_negative_pid_t_values() {
+        // `kill(0, sig)` broadcasts to the current process group and
+        // `kill(-1, sig)` broadcasts to every signal-able process — both
+        // return success and would spuriously hold a ghost span alive if
+        // pid_alive naively cast them through. Guard against both edges
+        // of the pid_t sign trap:
+        //
+        // - pid = 0 → pid_t = 0 → broadcast to pgrp.
+        // - pid = u32::MAX → pid_t = -1 → broadcast to all.
+        // - Any u32 that doesn't fit pid_t → tryfrom fails → dead.
+        assert!(!pid_alive(0), "pid 0 must not be treated as a live process");
+        assert!(!pid_alive(u32::MAX), "u32::MAX casts to pid_t=-1 (broadcast); must be dead");
     }
 
     #[test]
@@ -618,6 +712,56 @@ mod tests {
             read(dir.path(), "handed-off").is_some(),
             "disarmed guard must not remove the file"
         );
+    }
+
+    #[test]
+    fn span_guard_sets_and_clears_current_span_id() {
+        // Baseline: nothing set.
+        clear_current();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _g = SpanGuard::enter(dir.path(), "current-owning", "current-owning work");
+            let cur = CURRENT_SPAN_ID.lock().unwrap().clone();
+            assert_eq!(cur.as_deref(), Some("current-owning"));
+        }
+        let cur = CURRENT_SPAN_ID.lock().unwrap().clone();
+        assert_eq!(cur, None, "drop should have cleared CURRENT_SPAN_ID");
+    }
+
+    #[test]
+    fn span_guard_disarm_still_clears_current_span_id() {
+        // Disarm suppresses file removal but keeps current-id ownership;
+        // drop still clears CURRENT_SPAN_ID so a subsequent span in this
+        // process starts from a clean slot.
+        clear_current();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = SpanGuard::enter(dir.path(), "disarm-current", "disarm test");
+            g.disarm();
+            let cur = CURRENT_SPAN_ID.lock().unwrap().clone();
+            assert_eq!(cur.as_deref(), Some("disarm-current"), "current still set pre-drop");
+        }
+        let cur = CURRENT_SPAN_ID.lock().unwrap().clone();
+        assert_eq!(cur, None, "drop must clear current even after disarm");
+        // And disarm preserved the file itself.
+        assert!(read(dir.path(), "disarm-current").is_some());
+    }
+
+    #[test]
+    fn span_guard_clears_current_span_id_on_panic() {
+        // The whole point of moving CURRENT_SPAN_ID ownership into the
+        // guard: a panic between enter and manual clear no longer leaks
+        // a stale id into a subsequent span in the same process.
+        clear_current();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let result = std::panic::catch_unwind(|| {
+            let _g = SpanGuard::enter(&dir_path, "panic-current", "panic-current work");
+            panic!("simulated failure with CURRENT_SPAN_ID set");
+        });
+        assert!(result.is_err());
+        let cur = CURRENT_SPAN_ID.lock().unwrap().clone();
+        assert_eq!(cur, None, "panic-unwound drop should have cleared CURRENT_SPAN_ID");
     }
 
     #[test]
