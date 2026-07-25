@@ -244,10 +244,18 @@ set to the span id, per OTel correlation) so the in-progress row
 collapses into a log line.
 
 ```bash
-feed span enter <slug> --name "<one-line label>"
+feed span enter <slug> --pid "$$" --name "<one-line label>"
 feed span advance <slug> --name "<new one-line label>"
 feed span exit <slug> --body "settled line" --severity warn
 ```
+
+Pass `--pid "$$"` when invoked from a shell script: the span's
+owner (the shell) outlives the `feed` invocation itself, and the
+reaper watches the recorded PID. Omit `--pid` and the span looks
+stale the moment `feed span enter` returns, because it recorded
+`feed`'s own already-dead PID. From a Rust caller with a
+long-lived process, no flag needed — the default `std::process::id()`
+is the right owner.
 
 The `name` is the row's mutable display label — modeled on
 `tracing::Span::record()` / `otel.name`. Callers embed whatever

@@ -140,6 +140,15 @@ enum SpanCommand {
         /// This is the mutable display name — `advance` replaces it in place.
         #[arg(long)]
         name: Option<String>,
+        /// PID of the process that owns the span's work. Defaults to the
+        /// PID of this `feed` invocation. Override when the caller (a
+        /// shell script that does the actual work) outlives `feed span
+        /// enter` — the conventional invocation is `feed span enter <id>
+        /// --pid "$$"`. The reaper unlinks the span once the recorded PID
+        /// is gone; recording your own PID here would defeat cleanup by
+        /// making every span look stale the moment `feed` returns.
+        #[arg(long)]
+        pid: Option<u32>,
     },
     /// Advance an open span: rewrite the same file with a new display
     /// name. Modeled on `tracing::Span::record()` — the callsite narrates
@@ -306,9 +315,12 @@ fn truncate_argv(s: String) -> String {
 fn run_span(cmd: SpanCommand) -> Result<()> {
     let dir = spans::spans_dir();
     match cmd {
-        SpanCommand::Enter { id, name } => {
+        SpanCommand::Enter { id, name, pid } => {
             let name = name.unwrap_or_else(|| id.clone());
-            let span = Span::enter(&id, &name);
+            let span = match pid {
+                Some(p) => Span::enter_owned_by(&id, &name, p),
+                None => Span::enter(&id, &name),
+            };
             spans::write(&dir, &span)?;
             println!("span enter {}: {}", id, span.label());
             Ok(())

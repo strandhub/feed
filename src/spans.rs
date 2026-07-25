@@ -32,11 +32,14 @@
 //! 2. **Cross-process, reaper.** [`Span`] records the owning `pid` at
 //!    enter. [`list_open`] filters out (and unlinks) files whose owner is
 //!    no longer alive — the only defense against `SIGKILL`, OOM, and host
-//!    reboot mid-run, and the only mechanism that can work at all for
-//!    spans opened by short-lived processes (the `feed span enter` CLI
-//!    verb records the shell's pid, then exits — the span outlives its
-//!    creator by design). Legacy files without a `pid` get an age
-//!    fallback so this migration doesn't strand them forever.
+//!    reboot mid-run. When the writer isn't the owner (a shell script
+//!    invokes `feed span enter` and does the work itself), the caller
+//!    passes the real owner's PID via [`Span::enter_owned_by`] (Rust) or
+//!    `feed span enter <id> --pid "$$"` (shell) — modeled on systemd's
+//!    `PIDFile=`, where the invocation that writes the file and the
+//!    process that owns the work are deliberately separable. Legacy files
+//!    without a `pid` get an age fallback so this migration doesn't
+//!    strand them forever.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,13 +93,30 @@ pub struct Span {
 
 impl Span {
     /// A span entered now with the given display label. Records the
-    /// current process's PID so the reaper can detect a dead owner.
+    /// current process's PID as the owner — the reaper unlinks the span
+    /// once that PID is gone. For a span whose real owner outlives the
+    /// process that calls this (e.g. `feed span enter` invoked from a
+    /// shell script that then does the work), use [`Span::enter_owned_by`]
+    /// with the owner's PID.
     pub fn enter(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::enter_owned_by(id, name, std::process::id())
+    }
+
+    /// A span entered now, ownership attributed to `pid` instead of the
+    /// current process. Modeled on systemd's `PIDFile=` — the invocation
+    /// that writes the file is separate from the process that *owns* the
+    /// work, and only the latter's liveness gates cleanup.
+    ///
+    /// Typical caller: a shell script that opens a span for work it will
+    /// then run, invoked as `feed span enter <id> --pid "$$"`. The shell's
+    /// PID (`$$`) is the real owner; the `feed` process exits immediately
+    /// after writing the file.
+    pub fn enter_owned_by(id: impl Into<String>, name: impl Into<String>, pid: u32) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
             started: Utc::now(),
-            pid: Some(std::process::id()),
+            pid: Some(pid),
         }
     }
 
@@ -324,9 +344,20 @@ impl SpanGuard {
     /// still returned (armed with the id), so a subsequent drop tries a
     /// best-effort cleanup — no worse than the no-guard status quo.
     pub fn enter(dir: impl Into<PathBuf>, id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::enter_owned_by(dir, id, name, std::process::id())
+    }
+
+    /// Enter a span attributed to `pid` (not the current process). See
+    /// [`Span::enter_owned_by`] — same escape hatch, guard version.
+    pub fn enter_owned_by(
+        dir: impl Into<PathBuf>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        pid: u32,
+    ) -> Self {
         let dir = dir.into();
         let id = id.into();
-        let span = Span::enter(id.clone(), name);
+        let span = Span::enter_owned_by(id.clone(), name, pid);
         let _ = write(&dir, &span);
         Self { dir, id: Some(id) }
     }
@@ -472,6 +503,28 @@ mod tests {
     fn enter_records_current_pid() {
         let s = Span::enter("t", "task");
         assert_eq!(s.pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn enter_owned_by_records_given_pid_not_current() {
+        // The escape hatch: caller records a foreign PID so the reaper's
+        // liveness check tracks the *owner* of the work, not the process
+        // that wrote the file.
+        let s = Span::enter_owned_by("t", "task", 12345);
+        assert_eq!(s.pid, Some(12345));
+        assert_ne!(s.pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn span_guard_enter_owned_by_records_given_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use PID 1 — always alive on any Unix, so the reaper won't
+        // unlink it out from under us mid-test.
+        let g = SpanGuard::enter_owned_by(dir.path(), "delegated", "delegated work", 1);
+        assert_eq!(g.id(), "delegated");
+        let span = read(dir.path(), "delegated").unwrap();
+        assert_eq!(span.pid, Some(1));
+        drop(g);
     }
 
     #[test]
