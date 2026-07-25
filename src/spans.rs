@@ -19,6 +19,24 @@
 //! open span. This module owns the span data only — the on-disk format
 //! and the read/write primitives — mirroring how the crate root owns the
 //! event format. It does NOT own rendering or any polling loop.
+//!
+//! # Stale-span cleanup
+//!
+//! Two layers, because neither alone is sufficient:
+//!
+//! 1. **In-process, RAII.** [`SpanGuard`] removes the file on drop, so a
+//!    panic between enter and exit doesn't leak. Callers that want the
+//!    explicit exit path (append a settled record alongside removal) call
+//!    [`SpanGuard::disarm`] first — otherwise the guard would double-remove
+//!    a file whose settled record has already landed.
+//! 2. **Cross-process, reaper.** [`Span`] records the owning `pid` at
+//!    enter. [`list_open`] filters out (and unlinks) files whose owner is
+//!    no longer alive — the only defense against `SIGKILL`, OOM, and host
+//!    reboot mid-run, and the only mechanism that can work at all for
+//!    spans opened by short-lived processes (the `feed span enter` CLI
+//!    verb records the shell's pid, then exits — the span outlives its
+//!    creator by design). Legacy files without a `pid` get an age
+//!    fallback so this migration doesn't strand them forever.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,15 +79,24 @@ pub struct Span {
     pub name: String,
     /// When the span was first entered. A reader can show elapsed time.
     pub started: DateTime<Utc>,
+    /// PID of the process that entered the span. Used by [`list_open`]'s
+    /// reaper to detect and unlink spans whose owner is no longer alive
+    /// (crashes, SIGKILL, host reboot mid-run). `None` on files written
+    /// before this field existed — those fall through to the age-based
+    /// reaper rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl Span {
-    /// A span entered now with the given display label.
+    /// A span entered now with the given display label. Records the
+    /// current process's PID so the reaper can detect a dead owner.
     pub fn enter(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
             started: Utc::now(),
+            pid: Some(std::process::id()),
         }
     }
 
@@ -203,25 +230,126 @@ pub fn read(dir: &Path, id: &str) -> Option<Span> {
 /// Every currently-open span under `dir`, sorted by `id` for a stable
 /// render order. A missing dir means nothing is open → empty vec.
 /// Malformed and temp (`.tmp.*`) files are skipped, not fatal.
+///
+/// **Reaps stale files.** A span whose recorded PID is no longer alive
+/// (or a legacy pid-less file older than [`LEGACY_REAP_AGE`]) is
+/// unlinked and excluded from the result, so a crashed / killed owner
+/// doesn't leave permanent ghost rows in the overview. Removal is
+/// best-effort — a file we can't unlink (permissions, race with another
+/// reaper) is just skipped from the render, not surfaced.
 pub fn list_open(dir: &Path) -> Vec<Span> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
+    let now = Utc::now();
     let mut spans: Vec<Span> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter(|p| {
-            // Skip the atomic-write temp files (`.tmp.<pid>.json`).
             !p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(".tmp."))
         })
-        .filter_map(|p| fs::read_to_string(&p).ok())
-        .filter_map(|c| serde_json::from_str::<Span>(&c).ok())
+        .filter_map(|p| {
+            let contents = fs::read_to_string(&p).ok()?;
+            let span: Span = serde_json::from_str(&contents).ok()?;
+            if is_stale(&span, now) {
+                let _ = fs::remove_file(&p);
+                return None;
+            }
+            Some(span)
+        })
         .collect();
     spans.sort_by(|a, b| a.id.cmp(&b.id));
     spans
+}
+
+/// Legacy files (written before `Span::pid` existed) are reaped once
+/// they've been open longer than this. Long enough that a genuinely
+/// long-running task isn't reaped mid-flight, short enough that a
+/// stranded file goes away within a day.
+const LEGACY_REAP_AGE: chrono::Duration = chrono::Duration::hours(24);
+
+fn is_stale(span: &Span, now: DateTime<Utc>) -> bool {
+    match span.pid {
+        Some(pid) => !pid_alive(pid),
+        None => now.signed_duration_since(span.started) > LEGACY_REAP_AGE,
+    }
+}
+
+/// Best-effort liveness probe. On Linux, `/proc/<pid>` presence is
+/// authoritative for "process exists"; on other platforms we can't cheaply
+/// tell, so we conservatively report alive (never reap) to avoid unlinking
+/// a live process's span. PID reuse is a theoretical false-negative
+/// (reaper skips a span whose owner died and its PID was reassigned) —
+/// tolerated because the alternative is unlinking a live span, which is
+/// worse. On non-Linux this whole check is a no-op and stale spans fall
+/// through to the legacy age rule.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// RAII guard that removes the span file on drop, so an in-process panic
+/// between enter and exit doesn't leak a ghost span. Owns the span id and
+/// the spans dir; drop is best-effort (a failed unlink is silently
+/// swallowed — the reaper on the read side is the backstop).
+///
+/// Callers that want the explicit exit path — [`exit`] appends a settled
+/// [`LogRecord`] alongside removal — must call [`SpanGuard::disarm`]
+/// first so the guard doesn't double-remove after the settled record has
+/// already landed. The `disarm` → `exit` sequence is the happy path; the
+/// guard exists for panics, `?` early returns, and any other unwinding
+/// path that skips the explicit exit.
+///
+/// Does NOT help with `SIGKILL` / OOM / host reboot / cross-process spans
+/// — Rust can't run destructors on aborts. That's the reaper's job.
+#[must_use = "SpanGuard removes the span file on drop; hold it for the span's lifetime"]
+pub struct SpanGuard {
+    dir: PathBuf,
+    id: Option<String>,
+}
+
+impl SpanGuard {
+    /// Enter a span and take a guard that will remove the file on drop.
+    /// Writes the span file eagerly; if the write fails the guard is
+    /// still returned (armed with the id), so a subsequent drop tries a
+    /// best-effort cleanup — no worse than the no-guard status quo.
+    pub fn enter(dir: impl Into<PathBuf>, id: impl Into<String>, name: impl Into<String>) -> Self {
+        let dir = dir.into();
+        let id = id.into();
+        let span = Span::enter(id.clone(), name);
+        let _ = write(&dir, &span);
+        Self { dir, id: Some(id) }
+    }
+
+    /// The span id this guard is holding open.
+    pub fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or("")
+    }
+
+    /// Suppress the drop-time removal — the caller is taking over cleanup
+    /// (typically via [`exit`], which removes the file and appends a
+    /// settled record atomically). Idempotent.
+    pub fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = remove(&self.dir, &id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +466,121 @@ mod tests {
         set_current("second");
         clear_current();
         clear_current();
+    }
+
+    #[test]
+    fn enter_records_current_pid() {
+        let s = Span::enter("t", "task");
+        assert_eq!(s.pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn list_open_reaps_span_whose_pid_is_dead() {
+        // A span recorded against a PID that (a) is virtually certain not
+        // to exist and (b) is small enough to be a valid pid_t on Linux.
+        // We can't spawn-and-kill a process portably in a unit test — the
+        // fake-pid approach is what the reaper is actually built to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = Span {
+            id: "ghost".to_string(),
+            name: "ghost span".to_string(),
+            started: Utc::now(),
+            pid: Some(1),  // PID 1 always exists (init); use a fake ghost
+        };
+        // Overwrite the pid to something guaranteed-absent. u32::MAX is a
+        // safe choice: exceeds Linux's default pid_max and every other
+        // platform's practical range.
+        let ghost = Span { pid: Some(u32::MAX), ..ghost };
+        write(dir.path(), &ghost).unwrap();
+        // On Linux, list_open reaps and returns empty; the file is gone.
+        // On other platforms pid_alive returns true (conservative) so the
+        // span survives — we only assert the Linux path here since that's
+        // where the reaper does real work.
+        #[cfg(target_os = "linux")]
+        {
+            let open = list_open(dir.path());
+            assert!(open.is_empty(), "ghost span should be reaped");
+            assert!(read(dir.path(), "ghost").is_none(), "file should be unlinked");
+        }
+    }
+
+    #[test]
+    fn list_open_keeps_span_whose_pid_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &Span::enter("live", "live span")).unwrap();
+        let open = list_open(dir.path());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, "live");
+    }
+
+    #[test]
+    fn list_open_reaps_legacy_pidless_span_past_age_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Span {
+            id: "legacy".to_string(),
+            name: "legacy".to_string(),
+            started: Utc::now() - chrono::Duration::hours(48),
+            pid: None,
+        };
+        write(dir.path(), &old).unwrap();
+        let open = list_open(dir.path());
+        assert!(open.is_empty(), "stale legacy span should be reaped");
+    }
+
+    #[test]
+    fn list_open_keeps_legacy_pidless_span_within_age_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = Span {
+            id: "legacy-fresh".to_string(),
+            name: "legacy fresh".to_string(),
+            started: Utc::now() - chrono::Duration::hours(1),
+            pid: None,
+        };
+        write(dir.path(), &fresh).unwrap();
+        let open = list_open(dir.path());
+        assert_eq!(open.len(), 1);
+    }
+
+    #[test]
+    fn span_guard_removes_file_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _g = SpanGuard::enter(dir.path(), "guarded", "guarded work");
+            assert!(read(dir.path(), "guarded").is_some());
+        }
+        assert!(
+            read(dir.path(), "guarded").is_none(),
+            "drop should have removed the span file"
+        );
+    }
+
+    #[test]
+    fn span_guard_disarm_suppresses_drop_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = SpanGuard::enter(dir.path(), "handed-off", "handed off");
+            g.disarm();
+        }
+        assert!(
+            read(dir.path(), "handed-off").is_some(),
+            "disarmed guard must not remove the file"
+        );
+    }
+
+    #[test]
+    fn span_guard_removes_file_on_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let result = std::panic::catch_unwind(|| {
+            let _g = SpanGuard::enter(&dir_path, "panicky", "panicky work");
+            assert!(read(&dir_path, "panicky").is_some());
+            panic!("simulated failure between enter and exit");
+        });
+        assert!(result.is_err(), "inner block should have panicked");
+        assert!(
+            read(dir.path(), "panicky").is_none(),
+            "panic-unwound drop should have removed the file"
+        );
     }
 
     #[test]
