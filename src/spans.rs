@@ -10,7 +10,7 @@
 //! **one small file per span** that survives across processes:
 //!
 //! - enter → [`write`] `spans/<id>.json`
-//! - advance → [`write`] again with a bumped `phase`
+//! - advance → [`write`] again with a new display `name`
 //! - exit → [`remove`] the file (the caller separately appends a settled
 //!   [`crate::LogRecord`] to the event log, so the row collapses into the
 //!   feed below it)
@@ -30,57 +30,45 @@ use serde::{Deserialize, Serialize};
 use crate::{append, LogRecord, SeverityNumber};
 
 /// One open span. Serialized as a single JSON object in `spans/<id>.json`.
+///
+/// Modeled on `tracing`'s [`Span`](https://docs.rs/tracing/latest/tracing/struct.Span.html):
+/// `name` is the mutable display label (equivalent to `otel.name` in the
+/// tracing-opentelemetry bridge — a reserved field that overrides the
+/// exporter-visible name). `advance` swaps the name in place; the reader
+/// renders `name` verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     /// Stable identity for the span's whole life. Used as the file stem,
     /// so advancing rewrites the same file rather than creating a new one.
     pub id: String,
-    /// Human label for the row, e.g. a task slug. Distinct from `id` so
-    /// the identity can be opaque while the display stays readable.
+    /// Mutable one-line label the reader renders for this row. Callers
+    /// embed whatever narration they want (e.g. `"cli-verb-error: judging
+    /// session 3/17"`); no phase/total baked into the render.
     pub name: String,
-    /// Current phase (1-based) and the total phase count, rendered as
-    /// `phase/total`. `total` is `None` when the count isn't known.
-    pub phase: u32,
-    #[serde(default)]
-    pub total: Option<u32>,
     /// When the span was first entered. A reader can show elapsed time.
     pub started: DateTime<Utc>,
 }
 
 impl Span {
-    /// A span entered now at `phase` of `total`.
-    pub fn enter(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        phase: u32,
-        total: Option<u32>,
-    ) -> Self {
+    /// A span entered now with the given display label.
+    pub fn enter(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
-            phase,
-            total,
             started: Utc::now(),
         }
     }
 
-    /// Advance to `phase`, optionally rewriting the human label. `None`
-    /// preserves the existing name (a phase-only bump); `Some(new)` swaps
-    /// it (e.g. each issue of a batch triage).
-    pub fn advance(&mut self, phase: u32, name: Option<String>) {
-        self.phase = phase;
-        if let Some(n) = name {
-            self.name = n;
-        }
+    /// Rewrite the display label — the one operation `advance` performs.
+    /// The auditor calls this to narrate progress in place (`"reading
+    /// corpus"` → `"judging 3/17"` → `"writing report"`).
+    pub fn advance(&mut self, name: impl Into<String>) {
+        self.name = name.into();
     }
 
-    /// `name  phase N/M` (or `name  phase N` when the total is unknown) —
-    /// the one-line label a reader renders for this row.
+    /// The one-line label a reader renders for this row — `name` verbatim.
     pub fn label(&self) -> String {
-        match self.total {
-            Some(t) => format!("{}  phase {}/{}", self.name, self.phase, t),
-            None => format!("{}  phase {}", self.name, self.phase),
-        }
+        self.name.clone()
     }
 }
 
@@ -195,17 +183,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn label_with_and_without_total() {
-        let s = Span::enter("feed-widget", "feed-widget", 2, Some(4));
-        assert_eq!(s.label(), "feed-widget  phase 2/4");
-        let s = Span::enter("build", "build", 7, None);
-        assert_eq!(s.label(), "build  phase 7");
+    fn label_is_name_verbatim() {
+        let s = Span::enter("feed-widget", "feed-widget");
+        assert_eq!(s.label(), "feed-widget");
+        let s = Span::enter("build", "build: streaming layers 3/7");
+        assert_eq!(s.label(), "build: streaming layers 3/7");
     }
 
     #[test]
     fn write_then_read_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let span = Span::enter("t1", "task-one", 1, Some(3));
+        let span = Span::enter("t1", "task-one");
         write(dir.path(), &span).unwrap();
         let got = read(dir.path(), "t1").unwrap();
         assert_eq!(got, span);
@@ -214,20 +202,20 @@ mod tests {
     #[test]
     fn advance_rewrites_same_file() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), &Span::enter("t1", "task-one", 1, Some(3))).unwrap();
+        write(dir.path(), &Span::enter("t1", "task-one")).unwrap();
         let mut s = read(dir.path(), "t1").unwrap();
-        s.phase = 2;
+        s.advance("task-one: step two");
         write(dir.path(), &s).unwrap();
-        // Still exactly one open span, now at phase 2.
+        // Still exactly one open span, now with the new name.
         let open = list_open(dir.path());
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].phase, 2);
+        assert_eq!(open[0].name, "task-one: step two");
     }
 
     #[test]
     fn remove_deletes_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), &Span::enter("t1", "task-one", 1, None)).unwrap();
+        write(dir.path(), &Span::enter("t1", "task-one")).unwrap();
         remove(dir.path(), "t1").unwrap();
         assert!(read(dir.path(), "t1").is_none());
         // Second remove is a no-op, not an error.
@@ -239,7 +227,7 @@ mod tests {
         use crate::tail;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("feed.log");
-        write(dir.path(), &Span::enter("t1", "task-one", 1, None)).unwrap();
+        write(dir.path(), &Span::enter("t1", "task-one")).unwrap();
         exit(dir.path(), &log, "t1", SeverityNumber::Info, "task", "task-one done").unwrap();
         // Span file gone; settled record landed with span_id and
         // trace_id populated (both = the span id in our single-span
@@ -263,8 +251,8 @@ mod tests {
     #[test]
     fn list_open_sorted_by_id_and_skips_malformed() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), &Span::enter("zebra", "z", 1, Some(2))).unwrap();
-        write(dir.path(), &Span::enter("alpha", "a", 1, Some(2))).unwrap();
+        write(dir.path(), &Span::enter("zebra", "z")).unwrap();
+        write(dir.path(), &Span::enter("alpha", "a")).unwrap();
         // A malformed json file must be skipped, not abort the read.
         fs::write(dir.path().join("garbage.json"), "not json").unwrap();
         let open = list_open(dir.path());
@@ -273,35 +261,21 @@ mod tests {
     }
 
     #[test]
-    fn advance_can_override_name() {
+    fn advance_swaps_name() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), &Span::enter("triage", "batch", 1, Some(9))).unwrap();
+        write(dir.path(), &Span::enter("triage", "batch")).unwrap();
         let mut s = read(dir.path(), "triage").unwrap();
-        s.advance(2, Some("fix bug in foo".to_string()));
+        s.advance("fix bug in foo");
         write(dir.path(), &s).unwrap();
         let got = read(dir.path(), "triage").unwrap();
-        assert_eq!(got.phase, 2);
         assert_eq!(got.name, "fix bug in foo");
-        assert_eq!(got.total, Some(9));
-    }
-
-    #[test]
-    fn advance_without_name_preserves_existing_name() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), &Span::enter("triage", "batch", 1, Some(9))).unwrap();
-        let mut s = read(dir.path(), "triage").unwrap();
-        s.advance(2, None);
-        write(dir.path(), &s).unwrap();
-        let got = read(dir.path(), "triage").unwrap();
-        assert_eq!(got.phase, 2);
-        assert_eq!(got.name, "batch");
     }
 
     #[test]
     fn id_with_path_separators_is_sanitized() {
         let dir = tempfile::tempdir().unwrap();
         // A malicious / accidental id must not escape the spans dir.
-        write(dir.path(), &Span::enter("../escape", "x", 1, None)).unwrap();
+        write(dir.path(), &Span::enter("../escape", "x")).unwrap();
         // The file lands inside dir (flattened), and reads back by the
         // same id.
         assert!(read(dir.path(), "../escape").is_some());

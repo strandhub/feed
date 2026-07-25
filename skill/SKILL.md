@@ -244,10 +244,16 @@ set to the span id, per OTel correlation) so the in-progress row
 collapses into a log line.
 
 ```bash
-feed span enter <slug> --phase 1 --total 3 --name "<short label>"
-feed span advance <slug> --phase 2
+feed span enter <slug> --name "<one-line label>"
+feed span advance <slug> --name "<new one-line label>"
 feed span exit <slug> --body "settled line" --severity warn
 ```
+
+The `name` is the row's mutable display label — modeled on
+`tracing::Span::record()` / `otel.name`. Callers embed whatever
+narration they want in the name itself (e.g.
+`"cli-verb-error: judging session 3/17"`); the reader renders it
+verbatim.
 
 `<id>` is the stable identity for the span's whole life — by
 convention a task slug, but any stable string works. See

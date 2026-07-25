@@ -136,30 +136,21 @@ enum SpanCommand {
     Enter {
         /// Stable identity; reused by `advance`/`exit`.
         id: String,
-        /// Human label for the row (e.g. the task slug). Defaults to `id`.
+        /// One-line label for the row (e.g. the task slug). Defaults to `id`.
+        /// This is the mutable display name — `advance` replaces it in place.
         #[arg(long)]
         name: Option<String>,
-        /// Current phase, 1-based.
-        #[arg(long, default_value = "1")]
-        phase: u32,
-        /// Total phase count, rendered as `phase/total`. Omit if unknown.
-        #[arg(long)]
-        total: Option<u32>,
     },
-    /// Advance an open span to a new phase: rewrite the same file with a
-    /// bumped phase, preserving its total/start time. The name is
-    /// preserved unless `--name` is given (useful when each phase is a
-    /// distinct unit — e.g. the issue being triaged).
+    /// Advance an open span: rewrite the same file with a new display
+    /// name. Modeled on `tracing::Span::record()` — the callsite narrates
+    /// progress in place, and the reader (`claude-overview`) renders the
+    /// new name on next tick.
     Advance {
         /// Identity passed to `enter`.
         id: String,
-        /// New phase number.
+        /// New one-line label for the row.
         #[arg(long)]
-        phase: u32,
-        /// Replacement human label for the row. Omit to keep the existing
-        /// name (the phase-bump-only behavior).
-        #[arg(long)]
-        name: Option<String>,
+        name: String,
     },
     /// Close a span: delete `spans/<id>.json` AND append one settled
     /// record to the feed log (with `trace_id`/`span_id` = the span id),
@@ -315,18 +306,18 @@ fn truncate_argv(s: String) -> String {
 fn run_span(cmd: SpanCommand) -> Result<()> {
     let dir = spans::spans_dir();
     match cmd {
-        SpanCommand::Enter { id, name, phase, total } => {
+        SpanCommand::Enter { id, name } => {
             let name = name.unwrap_or_else(|| id.clone());
-            let span = Span::enter(&id, &name, phase, total);
+            let span = Span::enter(&id, &name);
             spans::write(&dir, &span)?;
             println!("span enter {}: {}", id, span.label());
             Ok(())
         }
-        SpanCommand::Advance { id, phase, name } => {
+        SpanCommand::Advance { id, name } => {
             let Some(mut span) = spans::read(&dir, &id) else {
                 bail!("no open span `{id}` to advance (call `feed span enter` first)");
             };
-            span.advance(phase, name);
+            span.advance(name);
             spans::write(&dir, &span)?;
             println!("span advance {}: {}", id, span.label());
             Ok(())
