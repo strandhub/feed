@@ -36,7 +36,7 @@ Claude thread for the actual failure detail. The feed message is
 intentionally terse ("claude exited with exit status: 1"); the real
 error text lives in the JSONL thread that the failed `claude -p`
 call produced. For schema, level vocabulary, and the on-disk path,
-see `~/.dotfiles/tools/feed/README.md` and the [[feed]] skill —
+see `~/projects/feed/README.md` and the [[feed]] skill —
 this skill is the read-join workflow, not the data-plane spec.
 
 ## Recipe

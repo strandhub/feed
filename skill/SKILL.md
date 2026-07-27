@@ -9,7 +9,7 @@ description: |
   ownership rule (the crate owns the data plane; rendering and
   polling belong to consumers like `claude-overview`).
 
-  TRIGGER when editing the `feed` crate at `~/.dotfiles/tools/feed/`
+  TRIGGER when editing the `feed` crate at `~/projects/feed/`
   (auto-fires via paths:), or when about to add a new **producer**
   into the feed — installing the `tracing` bridge in another Rust
   crate's `main()`, shelling to `feed "..." --target X` from a
@@ -31,7 +31,7 @@ paths: "tools/feed/**"
 
 Two-surface activity substrate: append-only **events** (`feed.log`)
 and live mutable **spans** (`spans/<id>.json`). Crate at
-`~/.dotfiles/tools/feed/`, JSONL log at
+`~/projects/feed/`, JSONL log at
 `~/.cache/claude-status/feed.log`, spans at
 `~/.cache/claude-status/spans/<id>.json`. Read the crate's
 `README.md` for the on-disk schema in detail; this skill carries
