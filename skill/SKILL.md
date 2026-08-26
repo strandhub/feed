@@ -9,8 +9,8 @@ description: |
   ownership rule (the crate owns the data plane; rendering and
   polling belong to consumers like `claude-overview`).
 
-  TRIGGER when editing the `feed` crate at `~/projects/feed/`
-  (auto-fires via paths:), or when about to add a new **producer**
+  TRIGGER when editing the `feed` crate at `~/projects/feed/`,
+  or when about to add a new **producer**
   into the feed — installing the `tracing` bridge in another Rust
   crate's `main()`, shelling to `feed "..." --target X` from a
   script, opening/advancing/closing a span via `feed span`. Also
@@ -24,7 +24,6 @@ description: |
   carries the substrate, not the editorial policy). SKIP when
   merely reading a row a feed reader rendered (no schema or
   producer question in play).
-paths: "tools/feed/**"
 ---
 
 # feed
