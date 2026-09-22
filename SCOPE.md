@@ -1,9 +1,10 @@
 # feed
 
 A tiny append-only **event** log + **span** ledger shared across
-workspace tools, built on `tracing`. Crate at `~/projects/feed/`
-(lib + `feed` CLI + optional `tracing` bridge feature). JSONL log at
-`~/.cache/claude-status/feed.log`; live spans at
+workspace tools, built on `tracing` and shaped as an OTel
+`LogRecord` subset on-disk. Crate at `~/projects/feed/` (lib +
+`feed` CLI + optional `tracing` bridge feature). JSONL log at
+`~/.local/share/claude-status/feed.log`; live spans at
 `~/.cache/claude-status/spans/<id>.json`.
 
 For surface (subcommands, flags): `feed --help`.
@@ -16,21 +17,27 @@ target to use): the `feed` skill's SKILL.md.
 
 Two-surface activity substrate for short-lived workspace tools:
 
-- **Events** — immutable points in time, modelled on
-  `tracing::Event`: a **level**, a **target**, a **message**. Outcome
-  is encoded in the level; an error is `error`, anything else is a
-  settled/successful event. Appended one JSONL line at a time.
+- **Events** — immutable points in time, modelled as OTel
+  `LogRecord`s: `severity_number`/`severity_text`, `body`,
+  optional `event_name` (the OTel Event marker), open
+  `attributes` bag (`source`, `operation`, `exception.*`,
+  producer-domain fields), optional `trace_id`/`span_id` for
+  span correlation. Appended one JSONL line at a time.
 - **Spans** — live, mutable cross-process state for **in-progress**
   things (a phasal task mid-phase, a build streaming layers). One
   file per open span: `enter` writes it, `advance` rewrites it,
-  `exit` removes it AND drops one settled event into the log.
+  `exit` removes it AND drops one settled record into the log
+  (with `trace_id`/`span_id` set to the span id).
 
 Two producer paths into the event surface: the `tracing` bridge
 (native, Rust producers install `feed::init()` and use `tracing!`
 macros) and the `feed` CLI (bypass, for everything else — shell
 callers, manual one-liners, non-Rust producers). The crate owns the
 **data plane** for both surfaces — the on-disk format and the
-read/write primitives.
+read/write primitives — AND the **severity semantics** (WARN =
+side-effect blocked but producer recovered; ERROR = producer fell
+over; INFO = a real event happened). See the `feed` skill for the
+honest-severity contract and the `event_name` naming discipline.
 
 ## What it does not own
 
@@ -40,11 +47,16 @@ read/write primitives.
 - **Polling loops, refresh cadence, widget toggles.** Consumers
   choose their own read rhythm. Feed exposes tail / read primitives
   and nothing more.
-- **What a producer chooses to emit, or at what level.** Feed
-  carries the schema and the bridge; the producer owns its message
-  text, target string, and severity choice. Friction about "the
-  `task` system emits at the wrong level" or "the target taxonomy is
-  too coarse" routes to *that producer*, not here.
+- **What a producer chooses to emit as the message text.** Feed
+  carries the schema, the bridge, and the severity semantics; the
+  producer owns its body text, its `source`, its `operation`, and
+  its `event_name` choice. Friction about "the `task` system's
+  message text is confusing" routes to *that producer*, not here.
+  BUT — if a producer is emitting at a dishonest severity (INFO on
+  a run that actually blocked a required side-effect; DEBUG chosen
+  to game a consumer's tail filter), that's a contract violation
+  against the feed severity semantics and belongs against the
+  producer as such.
 - **Cross-tool aggregations / dashboards / "what happened this
   week" reports.** Consumers can build them on top of the JSONL;
   feed owns the data plane only.
@@ -74,16 +86,12 @@ forward. `issue forward` exists for exactly this.
 
 ## Known structural tensions
 
-- **The crate's own README is currently stale on the span surface.**
-  The README (as of 2026-06-17) declares spans "deliberately not
-  modelled here," but `feed span enter|advance|exit` ship and the
-  in-progress widget reads `spans/<id>.json`. The README catches up
-  in the same PR as the next feed-shaped change. Tracked here when
-  filed.
 - **Producer-consumer ownership boundary is non-obvious from the
-  file tree.** Feed owns the data; the consumer owns rendering;
-  producers own their own emission choices. This is documented here
-  and in the feed skill's body, but a fresh reader looking at the
-  crate alone won't see the boundary — it lives in the conventions
-  the crate enforces, not the code itself. The skill is the load-
-  bearing carrier; if the skill drifts, the boundary blurs.
+  file tree.** Feed owns the data plane and the severity semantics;
+  the consumer owns rendering and its own filter recipes; producers
+  own their body text, `source`/`operation`/`event_name` choices,
+  and honesty about severity. This is documented here and in the
+  feed skill's body, but a fresh reader looking at the crate alone
+  won't see the boundary — it lives in the conventions the crate
+  enforces, not the code itself. The skill is the load-bearing
+  carrier; if the skill drifts, the boundary blurs.
